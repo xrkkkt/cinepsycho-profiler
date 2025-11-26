@@ -1,0 +1,5 @@
+{
+  "name": "CinePsycho Profiler",
+  "description": "A deep psychological analysis tool based on movie viewing history using Gemini AI.",
+  "requestFramePermissions": []
+}

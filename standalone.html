@@ -1,0 +1,409 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CinePsycho Profiler (Portable)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: { sans: ['Inter', 'sans-serif'], mono: ['JetBrains Mono', 'monospace'] },
+            animation: { blob: "blob 10s infinite", gradient: "gradient 8s linear infinite" },
+            keyframes: {
+              blob: {
+                "0%": { transform: "translate(0px, 0px) scale(1)" },
+                "33%": { transform: "translate(30px, -50px) scale(1.1)" },
+                "66%": { transform: "translate(-20px, 20px) scale(0.9)" },
+                "100%": { transform: "translate(0px, 0px) scale(1)" },
+              }
+            },
+          }
+        }
+      }
+    </script>
+    <style>
+      body { background-color: #110e1b; color: #e5e5e5; }
+      .scrollbar-hide::-webkit-scrollbar { display: none; }
+      .scanline::after {
+        content: ""; position: absolute; inset: 0;
+        background: linear-gradient(to bottom, transparent, rgba(236, 72, 153, 0.05), transparent);
+        animation: scanline 2s linear infinite; pointer-events: none;
+      }
+      @keyframes scanline { 0% { transform: translateY(-100%); } 100% { transform: translateY(100%); } }
+    </style>
+    <!-- Import Map for Modules -->
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "@google/genai": "https://esm.sh/@google/genai@0.1.1",
+        "recharts": "https://esm.sh/recharts@2.12.0?external=react,react-dom",
+        "html2canvas": "https://esm.sh/html2canvas@1.4.1"
+      }
+    }
+    </script>
+    <!-- Babel for JSX compilation in browser -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useEffect, useRef } from 'react';
+        import ReactDOM from 'react-dom/client';
+        import { GoogleGenAI } from '@google/genai';
+        import { Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, BarChart, Bar, XAxis, Tooltip, Cell } from 'recharts';
+        import html2canvas from 'html2canvas';
+
+        // --- CONSTANTS ---
+        const MOCK_REVIEWS = [
+            { title: "楚门的世界", rating: 5, comment: "走出摄影棚需要莫大的勇气。", date: "2023-11-15", tags: ["剧情"], category: "movie" },
+            { title: "局外人", rating: 5, comment: "今天，妈妈死了。", date: "2020-03-12", tags: ["存在主义"], category: "book" }
+        ];
+
+        const SYSTEM_INSTRUCTION = `
+You are an expert Psycho-Profiler. Analyze Movies, Books, and Music to construct a deep psychological profile.
+Output strictly in Simplified Chinese.
+Avatar Prompt MUST be "Studio Ghibli style".
+Output JSON format matching the schema provided in the context.
+        `;
+
+        // --- SERVICES: CRAWLER ---
+        const PROXY_PROVIDERS = [
+            { name: "Direct", format: (url) => url },
+            { name: "CorsProxy.io", format: (url) => `https://corsproxy.io/?${encodeURIComponent(url)}` },
+            { name: "CodeTabs", format: (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}` },
+            { name: "AllOrigins", format: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` }
+        ];
+
+        const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+        const parseDoubanPage = (html, category) => {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, "text/html");
+            const title = doc.querySelector('title')?.textContent || "";
+            if (title.includes("禁止访问") || title.includes("登录")) throw new Error("DOUBAN_BLOCK");
+
+            const items = doc.querySelectorAll(".item");
+            const data = [];
+            items.forEach((item) => {
+                try {
+                    const title = item.querySelector(".title a")?.textContent?.trim() || "Unknown";
+                    const ratingSpan = item.querySelector('[class^="rating"]');
+                    let rating = 0;
+                    if (ratingSpan) {
+                        const match = ratingSpan.className.match(/rating(\d)-t/);
+                        if (match) rating = parseInt(match[1], 10);
+                    }
+                    const comment = item.querySelector(".comment")?.textContent?.trim() || "";
+                    if (title) data.push({ title, rating, comment, category });
+                } catch (e) {}
+            });
+            return data;
+        };
+
+        const fetchUrlWithProxies = async (targetUrl, onLog) => {
+            const timestamp = new Date().getTime();
+            const urlWithCacheBust = `${targetUrl}&_t=${timestamp}`;
+            let lastError = null;
+
+            for (const provider of PROXY_PROVIDERS) {
+                const proxyUrl = provider.format(urlWithCacheBust);
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 10000);
+                
+                try {
+                    const response = await fetch(proxyUrl, { signal: controller.signal });
+                    clearTimeout(timeoutId);
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const html = await response.text();
+                    if (html.length < 200) throw new Error("Content too short");
+                    return html;
+                } catch (err) {
+                    clearTimeout(timeoutId);
+                    lastError = err;
+                    if(provider.name !== 'Direct') console.warn(`Proxy ${provider.name} failed`);
+                }
+            }
+            throw lastError || new Error("All proxies failed");
+        };
+
+        const crawlUserReviews = async (uid, onLog) => {
+            onLog(`🚀 启动便携版爬虫: ${uid}`);
+            const allReviews = [];
+            const categories = ['movie', 'book', 'music'];
+            
+            for (const cat of categories) {
+                const baseUrl = `https://${cat === 'movie' ? 'movie' : cat === 'book' ? 'book' : 'music'}.douban.com/people/${uid}/collect`;
+                const url = `${baseUrl}?start=0&sort=time&rating=all&filter=all&mode=grid`;
+                try {
+                    onLog(`📂 抓取 [${cat.toUpperCase()}]...`);
+                    const html = await fetchUrlWithProxies(url, onLog);
+                    const items = parseDoubanPage(html, cat);
+                    onLog(`✅ ${cat}: 获取 ${items.length} 条`);
+                    allReviews.push(...items);
+                    await sleep(1000);
+                } catch (e) {
+                    onLog(`⚠️ ${cat} 抓取跳过: ${e.message}`);
+                }
+            }
+            if (allReviews.length === 0) throw new Error("未抓取到数据，请检查网络或ID");
+            return allReviews;
+        };
+
+        // --- SERVICES: GEMINI ---
+        const analyzeProfile = async (reviews, apiKey) => {
+            if (!apiKey) throw new Error("Please enter your API Key");
+            const ai = new GoogleGenAI({ apiKey });
+            
+            const prompt = `
+            Analyze these ${reviews.length} reviews (Movie/Book/Music) and return JSON.
+            Data: ${JSON.stringify(reviews.slice(0, 60))}
+            Output Schema:
+            {
+              "layer1": { "topGenres": [{"name": "string", "value": 0}], "visualPreferences": [], "favoritesAnalysis": "", "hatedAnalysis": "", "bookMusicAnalysis": "", "summary": "" },
+              "layer2": { "logicScore": 0, "emotionalScore": 0, "criticalThinkingLevel": "", "vocabularyComplexity": "", "writingStyleAnalysis": "", "summary": "" },
+              "layer3": { "openness": 0, "conscientiousness": 0, "extraversion": 0, "agreeableness": 0, "neuroticism": 0, "mbti": "", "archetype": "", "summary": "" },
+              "layer4": { "coreValues": [], "moralAlignment": "", "ideologies": [], "philosophicalLeaning": "", "lifeViewSummary": "" },
+              "highlightReviews": [{"title": "", "quote": "", "commentary": "", "category": "movie"}],
+              "recommendations": [{"title": "", "type": "movie", "reason": ""}],
+              "avatarPrompt": "Studio Ghibli style character...",
+              "overallSummary": ""
+            }
+            `;
+
+            const resp = await ai.models.generateContent({
+                model: "gemini-2.5-flash",
+                contents: prompt,
+                config: { systemInstruction: SYSTEM_INSTRUCTION, responseMimeType: "application/json" }
+            });
+            
+            const profile = JSON.parse(resp.text);
+            
+            // Image Generation
+            if (profile.avatarPrompt) {
+                try {
+                    const imgResp = await ai.models.generateContent({
+                        model: 'gemini-2.5-flash-image',
+                        contents: { parts: [{ text: profile.avatarPrompt + ", masterpiece, high quality, 4k" }] }
+                    });
+                    if (imgResp.candidates?.[0]?.content?.parts?.[0]?.inlineData) {
+                        profile.avatarBase64 = imgResp.candidates[0].content.parts[0].inlineData.data;
+                    }
+                } catch (e) { console.warn("Image gen failed", e); }
+            }
+            return profile;
+        };
+
+        // --- COMPONENT: TERMINAL ---
+        const CrawlerTerminal = ({ logs }) => {
+            const ref = useRef(null);
+            useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [logs]);
+            return (
+                <div className="bg-black/90 p-4 rounded-lg font-mono text-xs h-64 overflow-y-auto text-green-400 border border-gray-800 shadow-xl">
+                    {logs.map((l, i) => <div key={i}><span className="text-green-600">$</span> {l}</div>)}
+                    <div ref={ref} />
+                </div>
+            );
+        };
+
+        // --- COMPONENT: REPORT ---
+        const AnalysisReport = ({ data, username }) => {
+            const ref = useRef(null);
+            const [downloading, setDownloading] = useState(false);
+            const normalize = (v) => (v <= 1 && v > 0) ? v * 100 : v;
+            
+            const download = async () => {
+                setDownloading(true);
+                try {
+                    const canvas = await html2canvas(ref.current, { backgroundColor: '#110e1b', scale: 2, useCORS: true });
+                    const link = document.createElement('a');
+                    link.download = `${username}_profile.png`;
+                    link.href = canvas.toDataURL();
+                    link.click();
+                } catch(e) { alert("Download failed"); }
+                setDownloading(false);
+            };
+
+            const radarData = [
+                { s: '开放', v: normalize(data.layer3.openness) }, { s: '尽责', v: normalize(data.layer3.conscientiousness) },
+                { s: '外向', v: normalize(data.layer3.extraversion) }, { s: '宜人', v: normalize(data.layer3.agreeableness) },
+                { s: '神经', v: normalize(data.layer3.neuroticism) }
+            ];
+            const colors = ['#F9A8D4', '#93C5FD', '#6EE7B7', '#C4B5FD', '#FCD34D'];
+
+            return (
+                <div className="max-w-4xl mx-auto pb-20">
+                    <div className="flex justify-end mb-4">
+                        <button onClick={download} className="px-6 py-2 bg-pink-600 rounded-full text-white font-bold">{downloading ? '生成中...' : '📸 下载长图'}</button>
+                    </div>
+                    <div ref={ref} className="bg-[#110e1b] p-8 rounded-[2rem] border border-white/10 relative overflow-hidden text-gray-100">
+                        {/* Avatar Header */}
+                        <div className="flex gap-8 items-center bg-white/5 p-8 rounded-3xl mb-8 border border-white/10">
+                            <div className="w-40 h-40 rounded-2xl bg-gradient-to-tr from-purple-400 to-pink-400 overflow-hidden flex-shrink-0 border-4 border-white/20">
+                                {data.avatarBase64 ? <img src={`data:image/png;base64,${data.avatarBase64}`} className="w-full h-full object-cover"/> : <div className="text-4xl flex items-center justify-center h-full">🔮</div>}
+                            </div>
+                            <div>
+                                <h1 className="text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-pink-300 to-blue-300">{username}</h1>
+                                <div className="mt-2 inline-block px-3 py-1 bg-teal-900/50 text-teal-300 rounded text-sm font-bold border border-teal-500/30">{data.layer3.mbti} · {data.layer3.archetype}</div>
+                                <p className="mt-4 text-gray-300 text-sm leading-relaxed">{data.overallSummary}</p>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            {/* Layer 1 */}
+                            <div className="bg-white/5 p-6 rounded-3xl border border-white/10">
+                                <h3 className="text-xl font-bold text-pink-300 mb-4">Layer 1: 审美</h3>
+                                <div className="h-48 mb-4">
+                                    <ResponsiveContainer>
+                                        <BarChart data={data.layer1.topGenres}>
+                                            <XAxis dataKey="name" stroke="#fff" fontSize={10} interval={0} />
+                                            <Bar dataKey="value" radius={[4,4,4,4]}>
+                                                {data.layer1.topGenres.map((e,i) => <Cell key={i} fill={colors[i%5]} />)}
+                                            </Bar>
+                                        </BarChart>
+                                    </ResponsiveContainer>
+                                </div>
+                                <div className="text-xs text-gray-400 space-y-2">
+                                    <p>❤️ 挚爱: {data.layer1.favoritesAnalysis}</p>
+                                    <p>⚡ 雷点: {data.layer1.hatedAnalysis}</p>
+                                </div>
+                            </div>
+
+                            {/* Layer 3 */}
+                            <div className="bg-white/5 p-6 rounded-3xl border border-white/10">
+                                <h3 className="text-xl font-bold text-blue-300 mb-4">Layer 3: 人格</h3>
+                                <div className="h-56">
+                                    <ResponsiveContainer>
+                                        <RadarChart cx="50%" cy="50%" outerRadius="70%" data={radarData}>
+                                            <PolarGrid stroke="#ffffff30" />
+                                            <PolarAngleAxis dataKey="s" tick={{fill:'#fff', fontSize:12}} />
+                                            <PolarRadiusAxis angle={30} domain={[0, 100]} tick={false} axisLine={false} />
+                                            <Radar dataKey="v" stroke="#818cf8" fill="#818cf8" fillOpacity={0.5} />
+                                        </RadarChart>
+                                    </ResponsiveContainer>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Quotes */}
+                        <div className="mt-6 bg-white/5 p-6 rounded-3xl border border-white/10">
+                            <h3 className="text-xl font-bold text-yellow-200 mb-4">✨ 灵光一现</h3>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {data.highlightReviews?.map((r,i) => (
+                                    <div key={i} className="bg-black/20 p-4 rounded-xl">
+                                        <p className="italic text-gray-300">"{r.quote}"</p>
+                                        <p className="text-right text-xs text-pink-400 mt-2">—— 评《{r.title}》</p>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                         
+                        {/* Recommendations */}
+                        <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
+                             {data.recommendations?.map((rec, i) => (
+                                <div key={i} className="bg-gradient-to-br from-indigo-900/40 to-purple-900/40 border border-white/10 p-4 rounded-xl">
+                                    <div className="font-bold text-cyan-300">{rec.title}</div>
+                                    <div className="text-xs text-gray-400 mt-1">{rec.reason}</div>
+                                </div>
+                             ))}
+                        </div>
+
+                    </div>
+                </div>
+            );
+        };
+
+        // --- APP ---
+        const App = () => {
+            const [apiKey, setApiKey] = useState('');
+            const [uid, setUid] = useState('');
+            const [status, setStatus] = useState('IDLE'); // IDLE, CRAWLING, ANALYZING, COMPLETE
+            const [logs, setLogs] = useState([]);
+            const [profile, setProfile] = useState(null);
+            const [error, setError] = useState('');
+
+            const start = async () => {
+                if(!apiKey) return setError("请输入 API Key");
+                if(!uid) return setError("请输入 UID");
+                
+                setError('');
+                setLogs([]);
+                setStatus('CRAWLING');
+
+                try {
+                    const reviews = await crawlUserReviews(uid, (msg) => setLogs(p => [...p, msg]));
+                    setStatus('ANALYZING');
+                    const res = await analyzeProfile(reviews, apiKey);
+                    setProfile(res);
+                    setStatus('COMPLETE');
+                } catch(e) {
+                    setError(e.message);
+                    setStatus('IDLE');
+                }
+            };
+
+            return (
+                <div className="min-h-screen p-4 md:p-8 relative overflow-hidden">
+                    <div className="fixed inset-0 pointer-events-none">
+                        <div className="absolute top-0 left-0 w-96 h-96 bg-purple-500/20 rounded-full blur-[100px] animate-blob"></div>
+                        <div className="absolute bottom-0 right-0 w-96 h-96 bg-blue-500/20 rounded-full blur-[100px] animate-blob"></div>
+                    </div>
+
+                    <nav className="max-w-4xl mx-auto flex justify-between items-center mb-12 relative z-10">
+                        <div className="text-2xl font-bold text-white">Cine<span className="text-pink-400">Psycho</span> <span className="text-xs text-gray-500 border border-gray-700 px-2 py-1 rounded">Portable</span></div>
+                        {status === 'COMPLETE' && <button onClick={() => setStatus('IDLE')} className="text-sm text-gray-400">🔄 Restart</button>}
+                    </nav>
+
+                    <main className="max-w-4xl mx-auto relative z-10">
+                        {status === 'IDLE' && (
+                            <div className="bg-white/5 backdrop-blur-xl border border-white/10 p-8 rounded-3xl shadow-2xl max-w-lg mx-auto">
+                                <h1 className="text-3xl font-bold text-center mb-6 bg-clip-text text-transparent bg-gradient-to-r from-pink-300 to-purple-300">灵魂显影 (便携版)</h1>
+                                
+                                <div className="space-y-4">
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1">Gemini API Key</label>
+                                        <input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)} className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-pink-500 transition-colors" placeholder="AI Studio Key..." />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1">豆瓣 UID</label>
+                                        <input type="text" value={uid} onChange={e=>setUid(e.target.value)} className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-purple-500 transition-colors" placeholder="user_id" />
+                                    </div>
+                                    {error && <p className="text-red-400 text-xs">{error}</p>}
+                                    <button onClick={start} className="w-full bg-gradient-to-r from-pink-500 to-purple-600 text-white font-bold py-3 rounded-xl hover:opacity-90 transition-opacity">开始分析</button>
+                                </div>
+                            </div>
+                        )}
+
+                        {status === 'CRAWLING' && (
+                            <div className="text-center space-y-4">
+                                <h2 className="text-2xl font-bold text-pink-300 animate-pulse">数据提取中...</h2>
+                                <CrawlerTerminal logs={logs} />
+                            </div>
+                        )}
+
+                        {status === 'ANALYZING' && (
+                            <div className="text-center py-20">
+                                <div className="text-6xl animate-bounce mb-4">🧠</div>
+                                <h2 className="text-2xl font-bold text-white">AI 正在深度解构...</h2>
+                                <p className="text-gray-400">正在生成宫崎骏风格画像</p>
+                            </div>
+                        )}
+
+                        {status === 'COMPLETE' && profile && <AnalysisReport data={profile} username={uid} />}
+                    </main>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
+    
